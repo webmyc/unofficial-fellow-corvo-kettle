@@ -21,8 +21,11 @@ simple systems that breathe. this is one.
 - **a morning schedule**: heat to 96° at 07:00, every day or just once.
 - **every setting from the kettle's own menu**: keep-warm time, pre-boil, units, clock face, clock sync, chime volume, language, altitude.
 - **model and firmware**, read straight from the kettle.
+- **a live browser tab**: the tab icon shows the water temperature and the title follows along (`71° → 93° · corvo kettle`). pin the tab and you've got a tiny thermometer next to your work.
 - **a menu-bar control** (via [SwiftBar](https://github.com/swiftbar/SwiftBar)) with live temperature.
 - **a terminal command**: `kettle on`, `kettle set 93`, `kettle schedule 07:00 96 daily`, `kettle wait`.
+
+<p align="center"><img src="docs/tabs.png" width="640" alt="browser tabs showing the live water temperature"></p>
 
 <p align="center"><img src="docs/panel-full.png" width="360" alt="the full control panel"></p>
 
