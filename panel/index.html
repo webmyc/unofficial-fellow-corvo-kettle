@@ -549,18 +549,18 @@ function updateTab(temp, warming, aim) {
   const c = document.createElement("canvas");
   c.width = c.height = 64;
   const g = c.getContext("2d");
-  g.fillStyle = tempColor(temp);
-  g.beginPath(); g.roundRect(2, 2, 60, 60, 16); g.fill();
+  g.fillStyle = "#E2683C";
+  g.beginPath(); g.roundRect(0, 0, 64, 64, 14); g.fill();
   const s = String(t);
-  g.font = `800 ${s.length > 2 ? 29 : 37}px ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif`;
+  g.font = `800 ${s.length > 2 ? 32 : 42}px ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif`;
   g.textAlign = "center"; g.textBaseline = "middle";
-  g.shadowColor = "rgba(0,0,0,.28)"; g.shadowBlur = 3;
+  g.shadowBlur = 0;
   g.fillStyle = "#fff";
-  g.fillText(s, 32, 37);
+  g.fillText(s, 32, 36);
   if (warming) {
     g.shadowBlur = 0;
     g.beginPath(); g.arc(55, 9, 6, 0, Math.PI * 2);
-    g.fillStyle = "#E2683C"; g.fill();
+    g.fillStyle = "#2A2622"; g.fill();
     g.lineWidth = 2.5; g.strokeStyle = "#fff"; g.stroke();
   }
   link.type = "image/png";
