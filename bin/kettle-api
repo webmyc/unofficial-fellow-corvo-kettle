@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""kettle-api: local wifi control for Fellow EKG kettles (Corvo EKG Pro / Stagg EKG Pro,
+firmware 1.2.x). Unofficial, not affiliated with Fellow.
+
+The binary settings format is ported from bramboe/stagg-ekg-plus-ha (MIT),
+https://github.com/bramboe/stagg-ekg-plus-ha. Every write selects only the field it
+changes, is read back and checked, and is never retried blindly."""
+import concurrent.futures, json, os, re, socket, struct, subprocess, sys, time, urllib.request
+from datetime import datetime
+
+CONFIG = os.path.expanduser("~/.config/kettle/config")
+
+def load_config():
+    cfg = {}
+    try:
+        for line in open(CONFIG):
+            m = re.match(r'\s*([A-Z_]+)\s*=\s*"?([^"\n]*)"?', line)
+            if m:
+                cfg[m.group(1)] = m.group(2).strip()
+    except FileNotFoundError:
+        pass
+    for k in ("KETTLE_IP", "KETTLE_MODEL"):
+        if os.environ.get(k):
+            cfg[k] = os.environ[k]
+    return cfg
+
+CFG = load_config()
+IP = CFG.get("KETTLE_IP", "")
+MODEL = CFG.get("KETTLE_MODEL", "Fellow EKG kettle")
+API = f"http://{IP}/api?i=0,p=0,d=0,t=3,s=1"
+CLI = f"http://{IP}/cli?cmd="
+
+def need_ip():
+    if not IP:
+        raise SystemExit("no kettle configured. run: kettle find")
+
+CLOCK_MODES = {0: "off", 1: "digital", 2: "analog"}
+LANGUAGES = {0: "english", 1: "french", 2: "spanish", 3: "chinese-simplified",
+             4: "chinese-traditional", 5: "korean", 6: "japanese"}
+HOLDS = (0, 15, 30, 45, 60)
+
+def dec_temp(raw):
+    return (raw & 0x7fff) / 2 if raw & 0x8000 else (raw - 32) / 1.8
+
+def read():
+    need_ip()
+    raw = urllib.request.urlopen(API, timeout=8).read()
+    if len(raw) != 17:
+        raise SystemExit(f"unexpected settings record ({len(raw)} bytes)")
+    mask, alt, target = struct.unpack_from("<HHH", raw)
+    d = {"target_c": dec_temp(target), "units": "C" if mask & 0x200 else "F"}
+    if mask & 1:
+        d["altitude_m"] = round((alt & 0x7fff) * (1 if alt & 0x8000 else 0.3048))
+    if mask & 0x10 and raw[11] < 24 and raw[10] < 60:
+        d["clock"] = f"{raw[11]:02d}:{raw[10]:02d}"
+    if mask & 0x20:
+        d["clock_mode"] = CLOCK_MODES.get(raw[12], raw[12])
+    if mask & 0x40:
+        d["hold_min"] = raw[13]
+    if mask & 0x80:
+        d["chime"] = raw[14]
+    if mask & 0x1000:
+        d["language"] = LANGUAGES.get(raw[15], raw[15])
+    if mask & 0x400:
+        d["preboil"] = bool(mask & 0x800)
+    if mask & 4:
+        d["schedule_on"] = bool(mask & 8)
+        d["schedule_time"] = f"{raw[9]:02d}:{raw[8]:02d}" if raw[9] < 24 and raw[8] < 60 else None
+        st = dec_temp(int.from_bytes(raw[6:8], "little"))
+        d["schedule_temp_c"] = st if 40 <= st <= 100 else None
+    d["_hex"] = raw.hex(" ")
+    return d
+
+def status():
+    need_ip()
+    return json.loads(urllib.request.urlopen(f"http://{IP}/temp", timeout=8).read()
+                      .decode().replace(":nan", ":null"))
+
+def post(payload):
+    req = urllib.request.Request(API, data=bytes(payload), method="POST")
+    urllib.request.urlopen(req, timeout=8).read()
+
+def cli(cmd):
+    urllib.request.urlopen(CLI + cmd.replace(" ", "+"), timeout=8).read()
+
+def confirm(check, what):
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        d = read()
+        if check(d):
+            return d
+        time.sleep(0.5)
+    raise SystemExit(f"{what}: kettle did not confirm. check the kettle screen; not retrying.")
+
+def record(mask):
+    raw = bytearray(17)
+    struct.pack_into("<H", raw, 0, mask)
+    return raw
+
+# ---------- setters ----------
+
+def set_temp(c):
+    c = float(c)
+    if not 40 <= c <= 100:
+        raise SystemExit("temperature must be 40–100°C")
+    raw = record(2)
+    struct.pack_into("<H", raw, 4, 0x8000 | round(c * 2))
+    post(raw)
+    want = round(c * 2) / 2
+    d = confirm(lambda d: abs(d["target_c"] - want) < 0.01, "set temperature")
+    return f"target {d['target_c']:g}°C"
+
+def set_units(u):
+    u = u.upper()[:1]
+    if u not in ("C", "F"):
+        raise SystemExit("units: c or f")
+    post(struct.pack("<H", 0x300 if u == "C" else 0x100) + bytes(15))
+    confirm(lambda d: d["units"] == u, "set units")
+    return f"units °{u}"
+
+def set_hold(v):
+    v = 0 if str(v).lower() == "off" else int(v)
+    if v not in HOLDS:
+        raise SystemExit("hold: off, 15, 30, 45 or 60")
+    raw = record(0x40); raw[13] = v; post(raw)
+    confirm(lambda d: d.get("hold_min") == v, "set hold")
+    return f"hold {v or 'off'}{' min' if v else ''}"
+
+def set_preboil(v):
+    on = str(v).lower() in ("on", "1", "true", "yes")
+    post(record(0x400 | (0x800 if on else 0)))
+    confirm(lambda d: d.get("preboil") is on, "set pre-boil")
+    return f"pre-boil {'on' if on else 'off'}"
+
+def set_chime(v):
+    v = 0 if str(v).lower() == "off" else int(v)
+    if not 0 <= v <= 10:
+        raise SystemExit("chime: 0–10 (0 = off)")
+    raw = record(0x80); raw[14] = v; post(raw)
+    confirm(lambda d: d.get("chime") == v, "set chime")
+    return f"chime {v}"
+
+def set_clock_mode(v):
+    rev = {name: i for i, name in CLOCK_MODES.items()}
+    if v not in rev:
+        raise SystemExit("clock display: off, digital or analog")
+    raw = record(0x20); raw[12] = rev[v]; post(raw)
+    confirm(lambda d: d.get("clock_mode") == v, "set clock display")
+    return f"clock display {v}"
+
+def set_language(v):
+    rev = {name: i for i, name in LANGUAGES.items()}
+    if v not in rev:
+        raise SystemExit("language: " + ", ".join(rev))
+    raw = record(0x1000); raw[15] = rev[v]; post(raw)
+    confirm(lambda d: d.get("language") == v, "set language")
+    return f"language {v}"
+
+def set_altitude(m):
+    m = int(m)
+    if not 0 <= m <= 3000 or m % 30:
+        raise SystemExit("altitude: 0–3000 m in steps of 30")
+    raw = record(1)
+    struct.pack_into("<H", raw, 2, 0x8000 | m)
+    post(raw)
+    confirm(lambda d: d.get("altitude_m") == m, "set altitude")
+    return f"altitude {m} m"
+
+def set_clock(hhmm=None):
+    now = datetime.now()
+    h, m = (int(x) for x in hhmm.split(":")) if hhmm else (now.hour, now.minute)
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise SystemExit("clock: HH:MM, or nothing to sync with this Mac")
+    raw = record(0x10); raw[10], raw[11] = m, h; post(raw)
+    nxt = (h * 60 + m + 1) % 1440
+    ok = {f"{h:02d}:{m:02d}", f"{nxt // 60:02d}:{nxt % 60:02d}"}
+    d = confirm(lambda d: d.get("clock") in ok, "set clock")
+    return f"clock {d['clock']}"
+
+def schedule(hhmm, c, mode):
+    if mode not in ("once", "daily"):
+        raise SystemExit("mode must be once or daily")
+    h, m = (int(x) for x in hhmm.split(":"))
+    c = float(c)
+    if not (0 <= h < 24 and 0 <= m < 60 and 40 <= c <= 100):
+        raise SystemExit("usage: schedule HH:MM <40-100°C> once|daily")
+    if status().get("state") != "S_Off":
+        raise SystemExit("turn the kettle off first; schedules can only be set in standby")
+    before = read()
+    raw = record(4)
+    struct.pack_into("<H", raw, 6, 0x8000 | round(c * 2))
+    raw[8], raw[9] = m, h
+    post(raw)
+    want_t, want_c = f"{h:02d}:{m:02d}", round(c * 2) / 2
+    confirm(lambda d: d.get("schedule_time") == want_t and d.get("schedule_temp_c") is not None
+            and abs(d["schedule_temp_c"] - want_c) < 0.2 and d.get("schedule_on") is False,
+            "write schedule")
+    cli(f"setsetting Repeat_sched {1 if mode == 'daily' else 0}")
+    cli(f"setsetting schedon {2 if mode == 'daily' else 1}")
+    d = confirm(lambda d: d.get("schedule_on") is True, "arm schedule")
+    if d.get("schedule_time") != want_t or d["target_c"] != before["target_c"]:
+        raise SystemExit("schedule armed but other values shifted. check the kettle screen.")
+    if status().get("state") != "S_Off":
+        raise SystemExit("warning: kettle left standby while arming. check it now.")
+    return f"schedule {mode} at {want_t}, {want_c:g}°C"
+
+def schedule_off():
+    cli("setsetting schedon 0")
+    cli("setsetting Repeat_sched 0")
+    confirm(lambda d: d.get("schedule_on") is False, "disable schedule")
+    return "schedule off"
+
+def info():
+    """model family and firmware, from the kettle's root page (works even when the CLI is muted)."""
+    need_ip()
+    body = urllib.request.urlopen(f"http://{IP}/", timeout=8).read().decode(errors="replace")
+    text = re.sub(r"<br\s*/?>", "\n", body, flags=re.I)
+    text = re.sub(r"<[^>]+>", "\n", text)
+    g = lambda rx: (re.search(rx, text) or [None, None])[1]
+    family = next((l.strip() for l in text.splitlines() if l.strip()), None)
+    return {
+        "model": MODEL,
+        "family": family,
+        "firmware": g(r"Current version:\s*([^\s]+)"),
+        "build": " ".join(filter(None, [g(r"Build date:\s*([^\n]+)"), g(r"Build time:\s*([^\n]+)")])) or None,
+        "partition": g(r"Running partition:\s*(\w+)"),
+        "ip": IP,
+    }
+
+def _probe(ip):
+    try:
+        j = json.loads(urllib.request.urlopen(f"http://{ip}/temp", timeout=1.2).read()
+                       .decode().replace(":nan", ":null"))
+        if {"temp", "temp_set", "state"} <= set(j):
+            return ip
+    except Exception:
+        return None
+
+def find():
+    """scan this mac's /24 for a kettle answering /temp."""
+    try:
+        me = subprocess.run(["ipconfig", "getifaddr", "en0"], capture_output=True, text=True).stdout.strip()
+    except FileNotFoundError:
+        me = ""
+    if not me:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.255.255.255", 1)); me = s.getsockname()[0]
+        finally:
+            s.close()
+    base = ".".join(me.split(".")[:3])
+    with concurrent.futures.ThreadPoolExecutor(64) as ex:
+        hits = [ip for ip in ex.map(_probe, (f"{base}.{i}" for i in range(1, 255))) if ip]
+    return hits
+
+SETTERS = {"temp": set_temp, "units": set_units, "hold": set_hold, "preboil": set_preboil,
+           "chime": set_chime, "clockface": set_clock_mode, "language": set_language,
+           "altitude": set_altitude}
+
+USAGE = """usage: kettle-api read | info | find
+       kettle-api set temp <40-100> | units c|f | hold off|15|30|45|60 | preboil on|off
+       kettle-api set chime <0-10> | clockface off|digital|analog | language <name> | altitude <m>
+       kettle-api clock [HH:MM]          (no time = sync with this Mac)
+       kettle-api schedule HH:MM <°C> once|daily | schedule off"""
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    cmd = a[0] if a else "read"
+    if cmd == "read":
+        d = read(); d.pop("_hex"); print(json.dumps(d))
+    elif cmd == "info":
+        print(json.dumps(info()))
+    elif cmd == "find":
+        hits = find()
+        print("\n".join(hits) if hits else "no kettle found on this network")
+        sys.exit(0 if hits else 1)
+    elif cmd == "raw":
+        print(json.dumps(read()))
+    elif cmd == "settemp" and len(a) == 2:          # kept for older menu items
+        print(set_temp(a[1]))
+    elif cmd == "set" and len(a) == 3 and a[1] in SETTERS:
+        print(SETTERS[a[1]](a[2]))
+    elif cmd == "clock" and len(a) in (1, 2):
+        print(set_clock(a[1] if len(a) == 2 else None))
+    elif cmd == "schedule" and len(a) == 2 and a[1] == "off":
+        print(schedule_off())
+    elif cmd == "schedule" and len(a) == 4:
+        print(schedule(a[1], a[2], a[3]))
+    else:
+        raise SystemExit(USAGE)

@@ -1,0 +1,139 @@
+#!/bin/bash
+# kettle: local wifi control for Fellow EKG kettles (Corvo EKG Pro / Stagg EKG Pro).
+# unofficial, not affiliated with Fellow. live state from /temp,
+# settings via kettle-api (every write is read back and checked).
+
+CFG="$HOME/.config/kettle/config"
+_env_ip="$KETTLE_IP"
+[ -f "$CFG" ] && . "$CFG"
+[ -n "$_env_ip" ] && KETTLE_IP="$_env_ip"
+API="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kettle-api"
+K="http://$KETTLE_IP"
+
+save_ip() {
+  mkdir -p "$(dirname "$CFG")"
+  if [ -f "$CFG" ] && grep -q '^KETTLE_IP=' "$CFG"; then
+    sed -i '' "s/^KETTLE_IP=.*/KETTLE_IP=$1/" "$CFG" 2>/dev/null || sed -i "s/^KETTLE_IP=.*/KETTLE_IP=$1/" "$CFG"
+  else
+    echo "KETTLE_IP=$1" >> "$CFG"
+  fi
+}
+
+cli()       { curl -s -m 5 -o /dev/null "$K/cli?cmd=$1"; }
+read_json() { curl -s -m 5 "$K/temp"; }
+notify()    { osascript -e "display notification \"${1//\"/}\" with title \"kettle\"" >/dev/null 2>&1; }
+
+pretty() {
+  jq -r '(.state | sub("^S_";"") | ascii_downcase) as $s
+    | "\(.temp*10|round/10)°C  ·  \($s)\(if $s == "off" then "" else " toward \(.temp_set|round)°C" end)"'
+}
+
+status() {
+  local j; j="$(read_json)"
+  [ -z "$j" ] && { echo "kettle not answering at $KETTLE_IP (unplugged, rebooting, or new IP?)" >&2; return 1; }
+  if [ "$1" = "--json" ]; then echo "$j"; else echo "$j" | pretty; fi
+}
+
+after_write() { sleep 1.5; status; }
+
+wait_ready() {
+  local j t s st
+  echo "waiting for the kettle… (ctrl-c to stop)"
+  while :; do
+    j="$(read_json)"
+    if [ -n "$j" ]; then
+      t=$(echo "$j" | jq -r '.temp'); s=$(echo "$j" | jq -r '.temp_set'); st=$(echo "$j" | jq -r '.state')
+      printf "\r%s        " "$(echo "$j" | pretty)"
+      if [ "$st" != "S_Off" ] && awk "BEGIN{exit !($t >= $s - 1)}"; then
+        echo; notify "water is at ${t%.*}°C"; return 0
+      fi
+    fi
+    sleep 5
+  done
+}
+
+ask() {
+  local a
+  a=$(osascript -e "text returned of (display dialog \"$1\" default answer \"$2\" with title \"kettle\")" 2>/dev/null) || exit 0
+  echo "$a"
+}
+
+ask_flow() {
+  case "$1" in
+    schedule)
+      t=$(ask "heat at what time? (HH:MM)" "07:00")
+      c=$(ask "to what temperature? (°C, 40-100)" "96")
+      m=$(osascript -e 'button returned of (display dialog "every day, or just once?" buttons {"cancel", "once", "daily"} default button "daily" with title "kettle")' 2>/dev/null)
+      [ "$m" = "once" ] || [ "$m" = "daily" ] || exit 0
+      run_notify schedule "$t" "$c" "$m" ;;
+    temp)     run_notify set temp "$(ask "target temperature (°C, 40-100)" "93")" ;;
+    altitude) run_notify set altitude "$(ask "altitude in meters (steps of 30)" "630")" ;;
+    clock)    run_notify clock "$(ask "set kettle clock (HH:MM)" "$(date +%H:%M)")" ;;
+  esac
+}
+
+run_notify() {
+  local out; out="$("$API" "$@" 2>&1)"; local rc=$?
+  notify "$out"; echo "$out"; return $rc
+}
+
+if [ -z "$KETTLE_IP" ] && [ "${1:-}" != "find" ] && [ "${1:-}" != "help" ]; then
+  echo "no kettle configured yet. run: kettle find" >&2; exit 1
+fi
+
+case "${1:-status}" in
+  find)
+    echo "looking for your kettle on this network…"
+    hits="$("$API" find)" || { echo "$hits"; echo "make sure the kettle is on wifi (it disappears while boiling)."; exit 1; }
+    ip="$(echo "$hits" | head -1)"
+    save_ip "$ip"
+    echo "found it at $ip, saved to $CFG"
+    [ "$(echo "$hits" | wc -l)" -gt 1 ] && echo "(more than one kettle answered: $(echo $hits))"
+    "$API" info | jq -r '"\(.family // "EKG") · firmware \(.firmware // "?")"' ;;
+  info)      "$API" info | jq . ;;
+  status|s)  status "$2" ;;
+  json)      status --json ;;
+  on)        cli "setstate+S_Heat"; after_write ;;
+  off)       cli "setstate+S_Off";  after_write ;;
+  set)       [ -z "$2" ] && { echo "usage: kettle set <40-100>"; exit 1; }
+             "$API" set temp "$2" ;;
+  cfg)       shift; "$API" set "$@" ;;
+  clock)     shift; "$API" clock "$@" ;;
+  schedule|sched)
+             shift
+             if [ -z "$1" ]; then
+               "$API" read | jq -r 'if .schedule_on then "schedule: \(.schedule_time) → \(.schedule_temp_c|round)°C" else "no schedule" end'
+             else "$API" schedule "$@"; fi ;;
+  settings)  "$API" read | jq . ;;
+  wait|ready) wait_ready ;;
+  beep)      cli "buz+880+1000+150"; echo "beep sent" ;;
+  n)         shift; run_notify "$@" ;;
+  ask)       ask_flow "$2" ;;
+  ip)        echo "$KETTLE_IP" ;;
+  *)
+    cat <<EOF
+kettle — unofficial local control for Fellow EKG kettles ($KETTLE_IP)
+
+  kettle find                  find the kettle on your network and remember it
+  kettle info                  model, firmware, address
+
+  kettle                       water temp and state
+  kettle on | off              heat / stop
+  kettle set 93                target temperature (°C)
+  kettle wait                  notify when the water is ready
+  kettle schedule              show schedule
+  kettle schedule 07:00 96 daily|once
+  kettle schedule off
+  kettle settings              every setting the kettle reports
+  kettle cfg hold off|15|30|45|60
+  kettle cfg preboil on|off
+  kettle cfg units c|f
+  kettle cfg chime 0-10
+  kettle cfg clockface off|digital|analog
+  kettle cfg language english|french|spanish|...
+  kettle cfg altitude 630
+  kettle clock                 sync kettle clock with this Mac
+  kettle beep
+EOF
+    ;;
+esac
