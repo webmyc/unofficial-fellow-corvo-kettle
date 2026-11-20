@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Unofficial Fellow Corvo Kettle</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='55' r='38' fill='%23E2683C'/><circle cx='38' cy='52' r='5' fill='%23fff'/><circle cx='62' cy='52' r='5' fill='%23fff'/><path d='M38 66 q12 10 24 0' stroke='%23fff' stroke-width='5' fill='none' stroke-linecap='round'/></svg>">
+<link rel="icon" id="favicon" href="data:,">
 <style>
   :root {
     --bg: #FBF5EC;
@@ -422,6 +422,7 @@ function render() {
   if (S && S.unconfigured) {
     $("dot").className = "dot";
     setConn(false, "not set up", "run: kettle find");
+    updateTab(null);
     $("mood").textContent = "no kettle set up yet. open terminal and run: kettle find";
     $("temp").textContent = "--";
     $("hero").className = "card hero mood-sleepy";
@@ -430,6 +431,7 @@ function render() {
   if (!S || !S.online) {
     $("dot").className = "dot";
     setConn(false, "offline", lastSeen ? "seen " + ago(lastSeen) : "looking for it");
+    updateTab(null);
     $("mood").textContent = "can't reach the kettle. it goes quiet on wifi while boiling, so if it's heating, give it a minute.";
     $("temp").textContent = "--";
     hero.className = "card hero mood-off";
@@ -466,6 +468,7 @@ function render() {
   else if (temp != null && temp >= 35) { mood = `cooling off at ${Math.round(temp)}°. target is ${fmt(target)}° when you're ready.`; face = "mood-sleepy"; }
   else { mood = `cold and calm. set to ${fmt(target)}°, ready when you are.`; face = "mood-sleepy"; }
   $("mood").textContent = mood;
+  updateTab(temp, heating && !cooling, aim);
 
   hero.className = "card hero " + face + (heating && !cooling ? " heating" : "") + ((temp ?? 0) >= 60 ? " hot" : "") + (ready && !wasReady ? " ready" : "");
 
@@ -530,6 +533,40 @@ function renderInfo(I) {
   $("aIp").textContent = I.ip || "–";
   $("fwLbl").textContent = I.firmware || "–";
 }
+// ---------- live browser tab: favicon shows the water temperature ----------
+const MARK_URL = "data:image/svg+xml," + encodeURIComponent(
+  document.querySelector(".mark").outerHTML.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"'));
+let lastTab = "";
+function updateTab(temp, warming, aim) {
+  const t = temp == null ? null : Math.round(temp);
+  document.title = t == null ? "corvo kettle"
+    : `${t}°${warming ? " → " + fmt(aim) + "°" : ""} · corvo kettle`;
+  const key = t == null ? "mark" : t + (warming ? "w" : "");
+  if (key === lastTab) return;
+  lastTab = key;
+  const link = $("favicon");
+  if (t == null) { link.type = "image/svg+xml"; link.href = MARK_URL; return; }
+  const c = document.createElement("canvas");
+  c.width = c.height = 64;
+  const g = c.getContext("2d");
+  g.fillStyle = tempColor(temp);
+  g.beginPath(); g.roundRect(2, 2, 60, 60, 16); g.fill();
+  const s = String(t);
+  g.font = `800 ${s.length > 2 ? 29 : 37}px ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif`;
+  g.textAlign = "center"; g.textBaseline = "middle";
+  g.shadowColor = "rgba(0,0,0,.28)"; g.shadowBlur = 3;
+  g.fillStyle = "#fff";
+  g.fillText(s, 32, 37);
+  if (warming) {
+    g.shadowBlur = 0;
+    g.beginPath(); g.arc(55, 9, 6, 0, Math.PI * 2);
+    g.fillStyle = "#E2683C"; g.fill();
+    g.lineWidth = 2.5; g.strokeStyle = "#fff"; g.stroke();
+  }
+  link.type = "image/png";
+  link.href = c.toDataURL("image/png");
+}
+
 function setConn(on, label, detail) {
   $("dot").className = "dot" + (on ? " on" : "");
   $("conn").textContent = label;
